@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import CryptoKit
 
 // MARK: - iMessage lookup via private IDS.framework (same service Messages.app uses)
 
@@ -286,10 +287,118 @@ final class BatchChecker: ObservableObject {
     }
 }
 
+// MARK: - Auto-update from GitHub Releases
+
+/// On launch: fetch the latest release, and if it's newer download `*.zip`, verify its Ed25519
+/// signature (`*.zip.sig`) against the embedded public key, swap the app bundle and relaunch.
+@MainActor
+final class Updater: ObservableObject {
+    static let repo = "IZIme07/imessage-checker"
+    static let publicKey = "ncGUCJJI0iqxVr+J66boB469fkxSNC1Loc6NUvFdm20="
+
+    @Published var status: String?
+
+    private struct Release: Decodable {
+        struct Asset: Decodable {
+            let name: String
+            let browser_download_url: URL
+        }
+        let tag_name: String
+        let assets: [Asset]
+    }
+
+    func checkForUpdate() async {
+        let app = Bundle.main.bundleURL
+        guard let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+              app.pathExtension == "app",
+              // Running from the DMG or a translocated copy: nothing to replace.
+              !app.path.hasPrefix("/Volumes/"), !app.path.contains("/AppTranslocation/"),
+              FileManager.default.isWritableFile(atPath: app.deletingLastPathComponent().path)
+        else { return }
+
+        do {
+            var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!)
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            let release = try JSONDecoder().decode(Release.self, from: try await URLSession.shared.data(for: request).0)
+            let latest = String(release.tag_name.trimmingPrefix("v"))
+
+            guard Self.isVersion(latest, newerThan: current),
+                  let zip = release.assets.first(where: { $0.name.hasSuffix(".zip") }),
+                  let sig = release.assets.first(where: { $0.name.hasSuffix(".zip.sig") })
+            else { return }
+
+            status = "Обновляюсь до \(latest)…"
+            let work = FileManager.default.temporaryDirectory.appendingPathComponent("imessage-checker-update-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+
+            let archive = work.appendingPathComponent("update.zip")
+            try await URLSession.shared.data(from: zip.browser_download_url).0.write(to: archive)
+            let signatureText = String(decoding: try await URLSession.shared.data(from: sig.browser_download_url).0, as: UTF8.self)
+
+            guard let signature = Data(base64Encoded: signatureText.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let key = try? Curve25519.Signing.PublicKey(rawRepresentation: Data(base64Encoded: Self.publicKey)!),
+                  key.isValidSignature(signature, for: try Data(contentsOf: archive))
+            else { throw LookupError(message: "Подпись обновления не прошла проверку") }
+
+            let unpacked = work.appendingPathComponent("unpacked")
+            try Self.run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path])
+            guard let newApp = try FileManager.default.contentsOfDirectory(at: unpacked, includingPropertiesForKeys: nil)
+                    .first(where: { $0.pathExtension == "app" }),
+                  Bundle(url: newApp)?.bundleIdentifier == Bundle.main.bundleIdentifier
+            else { throw LookupError(message: "Архив обновления повреждён") }
+
+            install(newApp, replacing: app)
+        } catch {
+            // Offline, GitHub rate limit, bad archive — just keep running the current version.
+            status = nil
+        }
+    }
+
+    /// Waits for this process to quit, swaps the bundle and relaunches the new version.
+    private func install(_ newApp: URL, replacing app: URL) {
+        let script = """
+        while kill -0 "$4" 2>/dev/null; do sleep 0.2; done
+        rm -rf "$3" && mv "$1" "$3" && mv "$2" "$1" && rm -rf "$3" || { [ -d "$1" ] || mv "$3" "$1"; }
+        xattr -dr com.apple.quarantine "$1" 2>/dev/null
+        open "$1"
+        """
+        let backup = app.deletingLastPathComponent().appendingPathComponent(".\(app.lastPathComponent).old")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script, "sh", app.path, newApp.path, backup.path, String(ProcessInfo.processInfo.processIdentifier)]
+        do {
+            try process.run()
+            NSApp.terminate(nil)
+        } catch {
+            status = nil
+        }
+    }
+
+    private static func run(_ tool: String, _ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw LookupError(message: "\(tool) failed") }
+    }
+
+    static func isVersion(_ a: String, newerThan b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }
+        let y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+            if l != r { return l > r }
+        }
+        return false
+    }
+}
+
 // MARK: - UI
 
 struct ContentView: View {
     @StateObject private var batch = BatchChecker()
+    @StateObject private var updater = Updater()
     @State private var input = ""
     @State private var state: Availability = .idle
     @State private var importing = false
@@ -320,6 +429,10 @@ struct ContentView: View {
             if !batch.rows.isEmpty || batch.note != nil {
                 results
             }
+
+            if let update = updater.status {
+                Text(update).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 24)
@@ -338,6 +451,7 @@ struct ContentView: View {
             if case .success(let url) = result { batch.load(url) }
         }
         .onAppear { focused = true }
+        .task { await updater.checkForUpdate() }
     }
 
     @ViewBuilder private var status: some View {
